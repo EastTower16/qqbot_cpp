@@ -486,9 +486,3 @@ for (const auto& attachment : message.attachments) {
 - 附件解析
 - 示例程序与 smoke test
 
-
-
-
-
-- 本地文件路径直接上传便利层
-- 更完整的消息类型常量 / intents 常量
