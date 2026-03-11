@@ -4,7 +4,7 @@ if(NOT DEFINED CMAKE_TOOLCHAIN_FILE AND EXISTS "G:/vcpkg/scripts/buildsystems/vc
     set(CMAKE_TOOLCHAIN_FILE "G:/vcpkg/scripts/buildsystems/vcpkg.cmake" CACHE STRING "Vcpkg toolchain file")
 endif()
 
-if(NOT DEFINED VCPKG_TARGET_TRIPLET)
+if(WIN32 AND NOT DEFINED VCPKG_TARGET_TRIPLET)
     set(VCPKG_TARGET_TRIPLET "x64-windows" CACHE STRING "Vcpkg target triplet")
 endif()
 
@@ -16,7 +16,9 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-add_compile_definitions(_WIN32_WINNT=0x0A00 WINVER=0x0A00)
+if(WIN32)
+    add_compile_definitions(_WIN32_WINNT=0x0A00 WINVER=0x0A00)
+endif()
 
 find_package(OpenSSL CONFIG REQUIRED)
 find_package(CURL CONFIG REQUIRED)
@@ -52,10 +54,15 @@ target_link_libraries(qqbot_sdk PUBLIC
     OpenSSL::SSL
     OpenSSL::Crypto
     nlohmann_json::nlohmann_json
-    ws2_32
-    crypt32
-    bcrypt
 )
+
+if(WIN32)
+    target_link_libraries(qqbot_sdk PUBLIC
+        ws2_32
+        crypt32
+        bcrypt
+    )
+endif()
 
 add_executable(qqbot_sdk_smoke
     src/examples/smoke_test.cpp
