@@ -10,6 +10,7 @@ namespace common {
 
 std::string ResolveAuthorizationString(const BotConfig& config, const transport::HttpTransportPtr& transport);
 std::string ResolveAccessToken(const BotConfig& config, const transport::HttpTransportPtr& transport);
+void ClearAccessTokenCache(const BotConfig& config);
 
 }  // namespace common
 }  // namespace qqbot

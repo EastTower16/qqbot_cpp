@@ -137,6 +137,16 @@ std::string ResolveAccessToken(const BotConfig& config, const transport::HttpTra
     return fetched.access_token;
 }
 
+void ClearAccessTokenCache(const BotConfig& config) {
+    if (config.client_secret.empty()) {
+        return;
+    }
+
+    const auto key = BuildCacheKey(config);
+    std::lock_guard<std::mutex> lock(CacheMutex());
+    Cache().erase(key);
+}
+
 std::string ResolveAuthorizationString(const BotConfig& config, const transport::HttpTransportPtr& transport) {
     if (!config.client_secret.empty()) {
         return "QQBot " + ResolveAccessToken(config, transport);

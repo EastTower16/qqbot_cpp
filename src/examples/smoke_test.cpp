@@ -1,13 +1,34 @@
 #include <cassert>
+#include <chrono>
+#include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <memory>
+#include <thread>
 #include <vector>
 
 #include "message/message_models.h"
 #include "openapi/v1/openapi_v1.h"
 #include "sdk/bot_sdk.h"
+#include "common/bot_config.h"
 #include "transport/http_transport.h"
 #include "websocket/websocket_client.h"
+
+namespace {
+
+std::filesystem::path GetSmokeSessionPath(const qqbot::common::BotConfig& config) {
+    if (const auto* local_app_data = std::getenv("LOCALAPPDATA"); local_app_data != nullptr && *local_app_data != '\0') {
+        return std::filesystem::path(local_app_data) / "qqbot_cpp" / "sessions" / ("session-" + config.app_id + ".json");
+    }
+    return std::filesystem::temp_directory_path() / "qqbot_cpp" / "sessions" / ("session-" + config.app_id + ".json");
+}
+
+void ClearSmokeSession(const qqbot::common::BotConfig& config) {
+    std::error_code ec;
+    std::filesystem::remove(GetSmokeSessionPath(config), ec);
+}
+
+}
 
 int main() {
     qqbot::common::BotConfig config;
@@ -15,6 +36,8 @@ int main() {
     config.client_secret = "client_secret";
     config.sandbox = true;
     config.max_retry = 2;
+
+    ClearSmokeSession(config);
 
     auto transport = std::make_shared<qqbot::transport::MockHttpTransport>();
 
@@ -66,16 +89,126 @@ int main() {
 
     websocket->Connect();
     assert(!websocket->gateway_url().empty());
+    assert(websocket->connection_phase() == qqbot::websocket::ConnectionPhase::kIdentifying);
     websocket->ReceiveHello(30000);
     websocket->ReceiveReady("session-1", 1);
+    assert(websocket->connection_phase() == qqbot::websocket::ConnectionPhase::kReady);
     websocket->ReceiveDispatch("MESSAGE_CREATE", R"({"content":"hello"})", 2);
     websocket->HandleClose(4000, true);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
 
     assert(websocket->session_state().heartbeat_interval_ms == 30000);
     assert(websocket->session_state().session_id == "session-1");
     assert(websocket->session_state().sequence == 2);
     assert(websocket->retry_count() == 1);
     assert(events.size() >= 3);
+    assert(websocket->connection_phase() == qqbot::websocket::ConnectionPhase::kIdentifying);
+    ClearSmokeSession(config);
+
+    qqbot::common::BotConfig matrix_config = config;
+    matrix_config.app_id = "app_id_matrix";
+
+    auto make_client = [&]() {
+        ClearSmokeSession(matrix_config);
+        auto client = qqbot::sdk::CreateWebSocket(matrix_config, transport);
+        client->Connect();
+        assert(client->connection_phase() == qqbot::websocket::ConnectionPhase::kIdentifying);
+        client->ReceiveHello(30000);
+        client->ReceiveReady("matrix-session", 10);
+        assert(client->connection_phase() == qqbot::websocket::ConnectionPhase::kReady);
+        client->ReceiveDispatch("MESSAGE_CREATE", R"({"content":"matrix"})", 11);
+        return client;
+    };
+
+    {
+        auto client = make_client();
+        client->HandleClose(4004, true);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+        const auto state = client->session_state();
+        assert(client->retry_count() == 1);
+        assert(state.session_id.empty());
+        assert(state.sequence == 0);
+        assert(state.last_command == "IDENTIFY");
+        assert(client->connection_phase() == qqbot::websocket::ConnectionPhase::kIdentifying);
+        ClearSmokeSession(matrix_config);
+    }
+
+    {
+        auto client = make_client();
+        client->HandleClose(4007, true);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+        const auto state = client->session_state();
+        assert(client->retry_count() == 1);
+        assert(state.session_id.empty());
+        assert(state.sequence == 0);
+        assert(state.last_command == "IDENTIFY");
+        assert(client->connection_phase() == qqbot::websocket::ConnectionPhase::kIdentifying);
+        ClearSmokeSession(matrix_config);
+    }
+
+    {
+        auto client = make_client();
+        client->HandleClose(4009, true);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+        const auto state = client->session_state();
+        assert(client->retry_count() == 1);
+        assert(state.session_id.empty());
+        assert(state.sequence == 0);
+        assert(state.last_command == "IDENTIFY");
+        assert(client->connection_phase() == qqbot::websocket::ConnectionPhase::kIdentifying);
+        ClearSmokeSession(matrix_config);
+    }
+
+    {
+        auto client = make_client();
+        client->HandleClose(4008, true);
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        const auto state = client->session_state();
+        assert(client->retry_count() == 1);
+        assert(state.session_id == "matrix-session");
+        assert(state.sequence == 11);
+        assert(state.last_command == "RESUME");
+        assert(client->connection_phase() == qqbot::websocket::ConnectionPhase::kReconnecting);
+        client->Disconnect();
+        assert(client->connection_phase() == qqbot::websocket::ConnectionPhase::kDisconnected);
+        ClearSmokeSession(matrix_config);
+    }
+
+    {
+        auto client = make_client();
+        client->HandleClose(4914, true);
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        const auto state = client->session_state();
+        assert(client->retry_count() == 0);
+        assert(state.last_command == "TERMINAL");
+        assert(client->connection_phase() == qqbot::websocket::ConnectionPhase::kTerminal);
+        client->Disconnect();
+        assert(client->connection_phase() == qqbot::websocket::ConnectionPhase::kDisconnected);
+        ClearSmokeSession(matrix_config);
+    }
+
+    {
+        auto client = qqbot::sdk::CreateWebSocket(matrix_config, transport);
+        assert(client->connection_phase() == qqbot::websocket::ConnectionPhase::kDisconnected);
+
+        client->ReceiveDispatch("MESSAGE_CREATE", R"({"content":"ignored"})", 99);
+        assert(client->session_state().sequence == 0);
+        assert(client->session_state().last_command.empty());
+        assert(client->connection_phase() == qqbot::websocket::ConnectionPhase::kDisconnected);
+
+        client->ReceiveReconnectSignal();
+        assert(client->session_state().last_command.empty());
+        assert(client->connection_phase() == qqbot::websocket::ConnectionPhase::kDisconnected);
+
+        client->ReceiveReady("ignored-session", 123);
+        assert(client->connection_phase() == qqbot::websocket::ConnectionPhase::kDisconnected);
+        assert(client->session_state().session_id.empty());
+        assert(client->session_state().sequence == 0);
+
+        client->Disconnect();
+        assert(client->connection_phase() == qqbot::websocket::ConnectionPhase::kDisconnected);
+        ClearSmokeSession(matrix_config);
+    }
 
     std::cout << "qqbot_sdk_smoke passed" << std::endl;
     return 0;
