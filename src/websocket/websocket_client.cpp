@@ -445,6 +445,11 @@ WebSocketClient::WebSocketClient(common::BotConfig config, transport::HttpTransp
         impl_->ssl_context.set_default_verify_paths();
         impl_->ssl_context.set_verify_mode(asio::ssl::verify_peer);
     }
+    {
+        std::lock_guard<std::mutex> lock(impl_->state_mutex);
+        impl_->control_loop_running = true;
+        impl_->reconnect_request_pending = false;
+    }
     impl_->reconnect_thread = std::thread([this]() {
         ControlLoop();
     });
@@ -462,251 +467,278 @@ void WebSocketClient::SetEventHandler(EventHandler handler) {
 }
 
 void WebSocketClient::Connect() {
-    SetConnectionPhase(ConnectionPhase::kConnecting, "Connect");
-    BootstrapGateway();
-
-    if (WithSessionState(impl_, session_state_, [](SessionState& state) { return state.session_id.empty(); })) {
-        const auto persisted = LoadPersistedSession(config_);
-        if (!persisted.session_id.empty()) {
-            WithSessionState(impl_, session_state_, [&](SessionState& state) {
-                state.session_id = persisted.session_id;
-                state.sequence = persisted.sequence;
-                state.last_heartbeat_sequence = persisted.sequence;
-                state.resumable = true;
-            });
-            const auto snapshot = SnapshotSessionState(impl_, session_state_);
-            std::cout << "Gateway session restored from disk. session_id=" << snapshot.session_id
-                      << " sequence=" << snapshot.sequence << std::endl;
-        }
-    }
-
-    if (dynamic_cast<transport::MockHttpTransport*>(transport_.get()) != nullptr) {
-        impl_->manual_disconnect = false;
-        impl_->reconnecting = false;
-        impl_->stop_requested = false;
-        const auto snapshot = MarkConnectedState(impl_, session_state_);
-        if (!snapshot.session_id.empty() && snapshot.sequence > 0) {
-            SavePersistedSession(config_, snapshot);
-        }
-        SetConnectionPhase(ConnectionPhase::kIdentifying, "ConnectMock");
-        return;
-    }
-
-    JoinOrDetachThread(impl_->heartbeat_thread);
-    JoinOrDetachThread(impl_->read_thread);
-    if (impl_->reconnect_thread.joinable() && impl_->reconnect_thread.get_id() != std::this_thread::get_id()) {
-        impl_->reconnect_thread.join();
-    }
-
-    const auto parsed = common::ParseUrl(gateway_url_);
-    const auto pre_connect_snapshot = SnapshotSessionState(impl_, session_state_);
-    std::cout << "Gateway connecting. host=" << parsed.host
-              << " port=" << parsed.port
-              << " target=" << parsed.target
-              << " retry_count=" << retry_count_
-              << " resumable=" << (pre_connect_snapshot.resumable ? "true" : "false")
-              << std::endl;
     {
-        std::lock_guard<std::mutex> lock(impl_->stream_mutex);
-        impl_->stream = std::make_unique<websocket::stream<beast::ssl_stream<beast::tcp_stream>>>(impl_->io_context, impl_->ssl_context);
+        std::lock_guard<std::mutex> lock(impl_->state_mutex);
+        if (!impl_->control_loop_running) {
+            impl_->control_loop_running = true;
+            impl_->reconnect_request_pending = false;
+        }
+    }
+    if (!impl_->reconnect_thread.joinable()) {
+        impl_->reconnect_thread = std::thread([this]() {
+            ControlLoop();
+        });
     }
 
-    auto results = impl_->resolver.resolve(parsed.host, parsed.port);
-    WithStream(impl_, [&](auto& stream) {
-        beast::get_lowest_layer(stream).connect(results);
-        stream.next_layer().handshake(asio::ssl::stream_base::client);
-        stream.handshake(parsed.host, parsed.target);
-    });
-
-    const auto connected_snapshot = MarkConnectedState(impl_, session_state_);
+    const auto current_phase = SnapshotConnectionPhase(impl_);
+    const auto reconnect_attempt = current_phase == ConnectionPhase::kReconnecting;
+    if (!reconnect_attempt && current_phase != ConnectionPhase::kDisconnected) {
+        throw common::SDKError(common::ErrorCode::kInvalidArgument, "connect is only allowed from disconnected or reconnecting state");
+    }
     impl_->manual_disconnect = false;
-    impl_->reconnecting = false;
     impl_->stop_requested = false;
-    impl_->last_connect_time_ms = NowMs();
-    SetConnectionPhase(ConnectionPhase::kIdentifying, "ConnectEstablished");
-    std::cout << "Gateway connected. session_mode="
-              << (connected_snapshot.resumable && !connected_snapshot.session_id.empty() ? "RESUME" : "IDENTIFY")
-              << " platform=" << DetectPlatformName()
-              << std::endl;
+    if (!reconnect_attempt) {
+        SetConnectionPhase(ConnectionPhase::kConnecting, "Connect");
+    }
 
-    impl_->read_thread = std::thread([this]() {
-        try {
-            while (!impl_->stop_requested) {
-                beast::flat_buffer buffer;
-                WithStream(impl_, [&](auto& stream) {
-                    stream.read(buffer);
+    try {
+        BootstrapGateway();
+
+        if (WithSessionState(impl_, session_state_, [](SessionState& state) { return state.session_id.empty(); })) {
+            const auto persisted = LoadPersistedSession(config_);
+            if (!persisted.session_id.empty()) {
+                WithSessionState(impl_, session_state_, [&](SessionState& state) {
+                    state.session_id = persisted.session_id;
+                    state.sequence = persisted.sequence;
+                    state.last_heartbeat_sequence = persisted.sequence;
+                    state.resumable = true;
                 });
-                const auto payload = beast::buffers_to_string(buffer.data());
-                const auto event = json::parse(payload);
-
-                const auto op = event.value("op", -1);
-                const auto state_snapshot = SnapshotSessionState(impl_, session_state_);
-                const auto sequence = event.contains("s") && !event["s"].is_null() ? event["s"].get<int>() : state_snapshot.sequence;
-                const auto event_name = event.value("t", std::string{});
-
-                if (op == 10) {
-                    const auto heartbeat_interval = event.at("d").at("heartbeat_interval").get<int>();
-                    ReceiveHello(heartbeat_interval);
-
-                    json identify_payload;
-                    const auto authorization = common::ResolveAuthorizationString(config_, transport_);
-                    const auto identify_state = SnapshotSessionState(impl_, session_state_);
-                    if (identify_state.resumable && !identify_state.session_id.empty()) {
-                        identify_payload = {
-                            {"op", 6},
-                            {"d", {{"token", authorization},
-                                    {"session_id", identify_state.session_id},
-                                    {"seq", identify_state.sequence}}}
-                        };
-                    } else {
-                        identify_payload = {
-                            {"op", 2},
-                            {"d", {{"token", authorization},
-                                    {"intents", config_.intents},
-                                    {"shard", {config_.shard_id, config_.shard_count}},
-                                    {"properties", {{"os", DetectPlatformName()}, {"browser", "qqbot_cpp"}, {"device", "qqbot_cpp"}}}}}
-                        };
-                    }
-                    MarkIdentifyMode(impl_, session_state_, identify_state.resumable && !identify_state.session_id.empty());
-
-                    {
-                        std::lock_guard<std::mutex> lock(impl_->write_mutex);
-                        WithStream(impl_, [&](auto& stream) {
-                            stream.write(asio::buffer(identify_payload.dump()));
-                        });
-                    }
-
-                    const auto after_identify = SnapshotSessionState(impl_, session_state_);
-                    std::cout << "Gateway identify sent. mode=" << after_identify.last_command
-                              << " session_id=" << after_identify.session_id
-                              << " sequence=" << after_identify.sequence << std::endl;
-
-                    if (!impl_->heartbeat_thread.joinable()) {
-                        impl_->heartbeat_thread = std::thread([this]() {
-                            try {
-                                std::cout << "Gateway heartbeat started. interval_ms="
-                                          << SnapshotSessionState(impl_, session_state_).heartbeat_interval_ms
-                                          << std::endl;
-                                while (!impl_->stop_requested) {
-                                    const auto heartbeat_state = SnapshotSessionState(impl_, session_state_);
-                                    const auto heartbeat_phase = SnapshotConnectionPhase(impl_);
-                                    if (heartbeat_state.heartbeat_interval_ms <= 0) {
-                                        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                                        continue;
-                                    }
-
-                                    std::this_thread::sleep_for(std::chrono::milliseconds(heartbeat_state.heartbeat_interval_ms));
-                                    if (impl_->stop_requested) {
-                                        break;
-                                    }
-
-                                    if (!CanSendHeartbeat(heartbeat_phase)) {
-                                        continue;
-                                    }
-
-                                    if (IsHeartbeatTimedOut()) {
-                                        MarkHeartbeatTimeoutState(impl_, session_state_);
-                                        const auto timeout_state = SnapshotSessionState(impl_, session_state_);
-                                        std::cerr << "Gateway heartbeat timed out. missed_acks="
-                                                  << timeout_state.consecutive_missed_acks
-                                                  << " session_id=" << timeout_state.session_id
-                                                  << std::endl;
-                                        HandleClose(4009, false);
-                                        break;
-                                    }
-
-                                    json heartbeat = {
-                                        {"op", 1},
-                                        {"d", heartbeat_state.sequence}
-                                    };
-
-                                    {
-                                        std::lock_guard<std::mutex> lock(impl_->write_mutex);
-                                        WithStream(impl_, [&](auto& stream) {
-                                            stream.write(asio::buffer(heartbeat.dump()));
-                                        });
-                                    }
-
-                                    MarkHeartbeatSentState(impl_, session_state_);
-                                    MarkHeartbeatSent();
-                                }
-                            } catch (const std::exception& ex) {
-                                if (!impl_->stop_requested) {
-                                    HandleClose(ExtractCloseCodeFromException(ex), true);
-                                    SetLastCommand(impl_, session_state_, "ERROR");
-                                    std::cerr << "Gateway heartbeat failed. error=" << ex.what() << std::endl;
-                                    Emit(EventType::kError, "HEARTBEAT", ex.what());
-                                }
-                            }
-                        });
-                    }
-                    continue;
-                }
-
-                if (op == 11) {
-                    if (!CanAcceptHeartbeatAck(SnapshotConnectionPhase(impl_))) {
-                        continue;
-                    }
-                    MarkHeartbeatAckState(impl_, session_state_);
-                    continue;
-                }
-
-                if (op == 7) {
-                    if (!CanReceiveReconnectSignal(SnapshotConnectionPhase(impl_))) {
-                        continue;
-                    }
-                    ReceiveReconnectSignal();
-                    HandleClose(1012, true);
-                    continue;
-                }
-
-                if (op == 9) {
-                    const auto resumable = event.contains("d") && event["d"].is_boolean() ? event["d"].get<bool>() : false;
-                    HandleClose(4009, resumable);
-                    continue;
-                }
-
-                if (event_name == "READY") {
-                    if (!CanReceiveReadyLike(SnapshotConnectionPhase(impl_))) {
-                        continue;
-                    }
-                    ReceiveReady(event.at("d").at("session_id").get<std::string>(), sequence);
-                    retry_count_ = 0;
-                    const auto ready_state = SnapshotSessionState(impl_, session_state_);
-                    std::cout << "Gateway ready. session_id=" << ready_state.session_id
-                              << " sequence=" << ready_state.sequence
-                              << std::endl;
-                    continue;
-                }
-
-                if (event_name == "RESUMED") {
-                    if (!CanReceiveReadyLike(SnapshotConnectionPhase(impl_))) {
-                        continue;
-                    }
-                    const auto resumed_state = MarkResumedState(impl_, session_state_);
-                    SetConnectionPhase(ConnectionPhase::kReady, "ReceiveResumed");
-                    SavePersistedSession(config_, resumed_state);
-                    retry_count_ = 0;
-                    Emit(EventType::kReady, "RESUMED", resumed_state.session_id);
-                    continue;
-                }
-
-                if (op == 0) {
-                    if (!CanReceiveDispatchInPhase(SnapshotConnectionPhase(impl_))) {
-                        continue;
-                    }
-                    ReceiveDispatch(event_name, event.at("d").dump(), sequence);
-                }
-            }
-        } catch (const std::exception& ex) {
-            if (!impl_->stop_requested) {
-                HandleClose(ExtractCloseCodeFromException(ex), true);
-                SetLastCommand(impl_, session_state_, "ERROR");
-                std::cerr << "Gateway read failed. error=" << ex.what() << std::endl;
-                Emit(EventType::kError, "READ", ex.what());
+                const auto snapshot = SnapshotSessionState(impl_, session_state_);
+                std::cout << "Gateway session restored from disk. session_id=" << snapshot.session_id
+                          << " sequence=" << snapshot.sequence << std::endl;
             }
         }
-    });
+
+        if (dynamic_cast<transport::MockHttpTransport*>(transport_.get()) != nullptr) {
+            impl_->reconnecting = false;
+            const auto snapshot = MarkConnectedState(impl_, session_state_);
+            if (!snapshot.session_id.empty() && snapshot.sequence > 0) {
+                SavePersistedSession(config_, snapshot);
+            }
+            SetConnectionPhase(ConnectionPhase::kIdentifying, "ConnectMock");
+            return;
+        }
+
+        JoinOrDetachThread(impl_->heartbeat_thread);
+        JoinOrDetachThread(impl_->read_thread);
+
+        const auto parsed = common::ParseUrl(gateway_url_);
+        const auto pre_connect_snapshot = SnapshotSessionState(impl_, session_state_);
+        std::cout << "Gateway connecting. host=" << parsed.host
+                  << " port=" << parsed.port
+                  << " target=" << parsed.target
+                  << " retry_count=" << retry_count_
+                  << " resumable=" << (pre_connect_snapshot.resumable ? "true" : "false")
+                  << std::endl;
+        {
+            std::lock_guard<std::mutex> lock(impl_->stream_mutex);
+            impl_->stream = std::make_unique<websocket::stream<beast::ssl_stream<beast::tcp_stream>>>(impl_->io_context, impl_->ssl_context);
+        }
+
+        auto results = impl_->resolver.resolve(parsed.host, parsed.port);
+        WithStream(impl_, [&](auto& stream) {
+            beast::get_lowest_layer(stream).connect(results);
+            stream.next_layer().handshake(asio::ssl::stream_base::client);
+            stream.handshake(parsed.host, parsed.target);
+        });
+
+        const auto connected_snapshot = MarkConnectedState(impl_, session_state_);
+        impl_->reconnecting = false;
+        impl_->last_connect_time_ms = NowMs();
+        SetConnectionPhase(ConnectionPhase::kIdentifying, "ConnectEstablished");
+        std::cout << "Gateway connected. session_mode="
+                  << (connected_snapshot.resumable && !connected_snapshot.session_id.empty() ? "RESUME" : "IDENTIFY")
+                  << " platform=" << DetectPlatformName()
+                  << std::endl;
+
+        impl_->read_thread = std::thread([this]() {
+            try {
+                while (!impl_->stop_requested) {
+                    beast::flat_buffer buffer;
+                    WithStream(impl_, [&](auto& stream) {
+                        stream.read(buffer);
+                    });
+                    const auto payload = beast::buffers_to_string(buffer.data());
+                    const auto event = json::parse(payload);
+
+                    const auto op = event.value("op", -1);
+                    const auto state_snapshot = SnapshotSessionState(impl_, session_state_);
+                    const auto sequence = event.contains("s") && !event["s"].is_null() ? event["s"].get<int>() : state_snapshot.sequence;
+                    const auto event_name = event.value("t", std::string{});
+
+                    if (op == 10) {
+                        const auto heartbeat_interval = event.at("d").at("heartbeat_interval").get<int>();
+                        ReceiveHello(heartbeat_interval);
+
+                        json identify_payload;
+                        const auto authorization = common::ResolveAuthorizationString(config_, transport_);
+                        const auto identify_state = SnapshotSessionState(impl_, session_state_);
+                        if (identify_state.resumable && !identify_state.session_id.empty()) {
+                            identify_payload = {
+                                {"op", 6},
+                                {"d", {{"token", authorization},
+                                        {"session_id", identify_state.session_id},
+                                        {"seq", identify_state.sequence}}}
+                            };
+                        } else {
+                            identify_payload = {
+                                {"op", 2},
+                                {"d", {{"token", authorization},
+                                        {"intents", config_.intents},
+                                        {"shard", {config_.shard_id, config_.shard_count}},
+                                        {"properties", {{"os", DetectPlatformName()}, {"browser", "qqbot_cpp"}, {"device", "qqbot_cpp"}}}}}
+                            };
+                        }
+                        MarkIdentifyMode(impl_, session_state_, identify_state.resumable && !identify_state.session_id.empty());
+
+                        {
+                            std::lock_guard<std::mutex> lock(impl_->write_mutex);
+                            WithStream(impl_, [&](auto& stream) {
+                                stream.write(asio::buffer(identify_payload.dump()));
+                            });
+                        }
+
+                        const auto after_identify = SnapshotSessionState(impl_, session_state_);
+                        std::cout << "Gateway identify sent. mode=" << after_identify.last_command
+                                  << " session_id=" << after_identify.session_id
+                                  << " sequence=" << after_identify.sequence << std::endl;
+
+                        if (!impl_->heartbeat_thread.joinable()) {
+                            impl_->heartbeat_thread = std::thread([this]() {
+                                try {
+                                    std::cout << "Gateway heartbeat started. interval_ms="
+                                              << SnapshotSessionState(impl_, session_state_).heartbeat_interval_ms
+                                              << std::endl;
+                                    while (!impl_->stop_requested) {
+                                        const auto heartbeat_state = SnapshotSessionState(impl_, session_state_);
+                                        const auto heartbeat_phase = SnapshotConnectionPhase(impl_);
+                                        if (heartbeat_state.heartbeat_interval_ms <= 0) {
+                                            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                                            continue;
+                                        }
+
+                                        std::this_thread::sleep_for(std::chrono::milliseconds(heartbeat_state.heartbeat_interval_ms));
+                                        if (impl_->stop_requested) {
+                                            break;
+                                        }
+
+                                        if (!CanSendHeartbeat(heartbeat_phase)) {
+                                            continue;
+                                        }
+
+                                        if (IsHeartbeatTimedOut()) {
+                                            MarkHeartbeatTimeoutState(impl_, session_state_);
+                                            const auto timeout_state = SnapshotSessionState(impl_, session_state_);
+                                            std::cerr << "Gateway heartbeat timed out. missed_acks="
+                                                      << timeout_state.consecutive_missed_acks
+                                                      << " session_id=" << timeout_state.session_id
+                                                      << std::endl;
+                                            HandleClose(4009, false);
+                                            break;
+                                        }
+
+                                        json heartbeat = {
+                                            {"op", 1},
+                                            {"d", heartbeat_state.sequence}
+                                        };
+
+                                        {
+                                            std::lock_guard<std::mutex> lock(impl_->write_mutex);
+                                            WithStream(impl_, [&](auto& stream) {
+                                                stream.write(asio::buffer(heartbeat.dump()));
+                                            });
+                                        }
+
+                                        MarkHeartbeatSentState(impl_, session_state_);
+                                        MarkHeartbeatSent();
+                                    }
+                                } catch (const std::exception& ex) {
+                                    if (!impl_->stop_requested) {
+                                        HandleClose(ExtractCloseCodeFromException(ex), true);
+                                        SetLastCommand(impl_, session_state_, "ERROR");
+                                        std::cerr << "Gateway heartbeat failed. error=" << ex.what() << std::endl;
+                                        Emit(EventType::kError, "HEARTBEAT", ex.what());
+                                    }
+                                }
+                            });
+                        }
+                        continue;
+                    }
+
+                    if (op == 11) {
+                        if (!CanAcceptHeartbeatAck(SnapshotConnectionPhase(impl_))) {
+                            continue;
+                        }
+                        MarkHeartbeatAckState(impl_, session_state_);
+                        continue;
+                    }
+
+                    if (op == 7) {
+                        if (!CanReceiveReconnectSignal(SnapshotConnectionPhase(impl_))) {
+                            continue;
+                        }
+                        ReceiveReconnectSignal();
+                        HandleClose(1012, true);
+                        continue;
+                    }
+
+                    if (op == 9) {
+                        const auto resumable = event.contains("d") && event["d"].is_boolean() ? event["d"].get<bool>() : false;
+                        HandleClose(4009, resumable);
+                        continue;
+                    }
+
+                    if (event_name == "READY") {
+                        if (!CanReceiveReadyLike(SnapshotConnectionPhase(impl_))) {
+                            continue;
+                        }
+                        ReceiveReady(event.at("d").at("session_id").get<std::string>(), sequence);
+                        retry_count_ = 0;
+                        const auto ready_state = SnapshotSessionState(impl_, session_state_);
+                        std::cout << "Gateway ready. session_id=" << ready_state.session_id
+                                  << " sequence=" << ready_state.sequence
+                                  << std::endl;
+                        continue;
+                    }
+
+                    if (event_name == "RESUMED") {
+                        if (!CanReceiveReadyLike(SnapshotConnectionPhase(impl_))) {
+                            continue;
+                        }
+                        const auto resumed_state = MarkResumedState(impl_, session_state_);
+                        SetConnectionPhase(ConnectionPhase::kReady, "ReceiveResumed");
+                        SavePersistedSession(config_, resumed_state);
+                        retry_count_ = 0;
+                        Emit(EventType::kReady, "RESUMED", resumed_state.session_id);
+                        continue;
+                    }
+
+                    if (op == 0) {
+                        if (!CanReceiveDispatchInPhase(SnapshotConnectionPhase(impl_))) {
+                            continue;
+                        }
+                        ReceiveDispatch(event_name, event.at("d").dump(), sequence);
+                    }
+                }
+            } catch (const std::exception& ex) {
+                if (!impl_->stop_requested) {
+                    HandleClose(ExtractCloseCodeFromException(ex), true);
+                    SetLastCommand(impl_, session_state_, "ERROR");
+                    std::cerr << "Gateway read failed. error=" << ex.what() << std::endl;
+                    Emit(EventType::kError, "READ", ex.what());
+                }
+            }
+        });
+    } catch (...) {
+        impl_->stop_requested = true;
+        if (reconnect_attempt) {
+            SetConnectionPhase(ConnectionPhase::kReconnecting, "ConnectFailed");
+        } else {
+            impl_->reconnecting = false;
+            SetConnectionPhase(ConnectionPhase::kDisconnected, "ConnectFailed");
+        }
+        throw;
+    }
 }
 
 void WebSocketClient::Disconnect(int close_code) {
@@ -719,6 +751,8 @@ void WebSocketClient::Disconnect(int close_code) {
         std::lock_guard<std::mutex> lock(impl_->state_mutex);
         impl_->control_loop_running = false;
         impl_->reconnect_request_pending = false;
+        impl_->pending_close_code = 0;
+        impl_->pending_close_resumable = false;
     }
     impl_->reconnect_cv.notify_all();
     std::cout << "Gateway disconnect requested. close_code=" << close_code << std::endl;
@@ -748,7 +782,6 @@ void WebSocketClient::Disconnect(int close_code) {
 
     MarkClosedState(impl_, session_state_, close_code, false, "CLOSE");
     SetConnectionPhase(ConnectionPhase::kDisconnected, "DisconnectDone");
-    ClearPersistedSession(config_);
     Emit(EventType::kDisconnect, "CLOSE", std::to_string(close_code));
 }
 
